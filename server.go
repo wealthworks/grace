@@ -1,4 +1,4 @@
-package gracemux
+package graceserver
 
 import (
 	"bytes"
@@ -6,16 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"sync"
 	"syscall"
 
-	"google.golang.org/grpc"
-
-	"github.com/cockroachdb/cmux"
 	"github.com/facebookgo/grace/gracenet"
 )
 
@@ -26,72 +22,58 @@ var (
 	ppid       = os.Getppid()
 )
 
-type graceMux struct {
-	cMux       cmux.CMux
-	grpcServer *grpc.Server
-	httpServer *http.Server
-
-	net              *gracenet.Net
-	listener, gl, hl net.Listener
-	errors           chan error
-	pidfile          string
+type Server interface {
+	Serve(l net.Listener)
+	Stop()
 }
 
-func NewGraceMux(net, addr string) *graceMux {
-	gc := &graceMux{
-		net: &gracenet.Net{},
+type graceServer struct {
+	server   Server
+	net      *gracenet.Net
+	listener net.Listener
+	errors   chan error
+	pidfile  string
+}
+
+func NewGraceServer(s Server, net, addr string) *graceServer {
+	gs := &graceServer{
+		server: s,
+		net:    &gracenet.Net{},
 
 		//for  StartProcess error.
 		errors:  make(chan error),
 		pidfile: gracePid,
 	}
-	l, err := gc.net.Listen(net, addr)
+	l, err := gs.net.Listen(net, addr)
 	if err != nil {
 		panic(err)
 	}
-	gc.listener = l
-	gc.cMux = cmux.New(l)
-	gc.gl = gc.cMux.Match(cmux.HTTP2HeaderField("content-type", "application/grpc"))
-	gc.hl = gc.cMux.Match(cmux.HTTP1Fast())
-	return gc
+	gs.listener = l
+	return gs
 }
 
-func (gc *graceMux) SetGrpcServer(s *grpc.Server) {
-	gc.grpcServer = s
-}
-
-func (gc *graceMux) SetHttpServer(s *http.Server) {
-	gc.httpServer = s
-}
-
-func (gc *graceMux) serve() {
-	go gc.grpcServer.Serve(gc.gl)
-	go gc.httpServer.Serve(gc.hl)
-	go gc.cMux.Serve()
-}
-
-func (gc *graceMux) Serve() error {
+func (gs *graceServer) Serve() error {
 
 	if *verbose {
 		if didInherit {
 			if ppid == 1 {
-				log.Printf("Listening on init activated %s\n", pprintAddr(gc.listener))
+				log.Printf("Listening on init activated %s\n", pprintAddr(gs.listener))
 			} else {
 				const msg = "Graceful handoff of %s with new pid %d replace old pid %d"
-				log.Printf(msg, pprintAddr(gc.listener), os.Getpid(), ppid)
+				log.Printf(msg, pprintAddr(gs.listener), os.Getpid(), ppid)
 			}
 		} else {
 			const msg = "Serving %s with pid %d\n"
-			log.Printf(msg, pprintAddr(gc.listener), os.Getpid())
+			log.Printf(msg, pprintAddr(gs.listener), os.Getpid())
 		}
 	}
 
-	err := gc.doWritePid(os.Getpid())
+	err := gs.doWritePid(os.Getpid())
 	if err != nil {
 		log.Println(err)
 	}
 
-	gc.serve()
+	go gs.server.Serve(gs.listener)
 
 	if didInherit && ppid != 1 {
 		if err := syscall.Kill(ppid, syscall.SIGTERM); err != nil {
@@ -102,11 +84,11 @@ func (gc *graceMux) Serve() error {
 	waitdone := make(chan struct{})
 	go func() {
 		defer close(waitdone)
-		gc.wait()
+		gs.wait()
 	}()
 
 	select {
-	case err := <-gc.errors:
+	case err := <-gs.errors:
 		if err == nil {
 			panic("unexpected nil error")
 		}
@@ -119,18 +101,14 @@ func (gc *graceMux) Serve() error {
 	}
 }
 
-func (gc graceMux) GracefulStop() {
-
-}
-
-func (gc *graceMux) wait() {
+func (gs *graceServer) wait() {
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go gc.signalHandler(&wg)
+	go gs.signalHandler(&wg)
 	wg.Wait()
 }
 
-func (gc *graceMux) signalHandler(wg *sync.WaitGroup) {
+func (gs *graceServer) signalHandler(wg *sync.WaitGroup) {
 	ch := make(chan os.Signal, 10)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2)
 	for {
@@ -140,22 +118,22 @@ func (gc *graceMux) signalHandler(wg *sync.WaitGroup) {
 		case syscall.SIGINT, syscall.SIGTERM:
 			defer wg.Done()
 			signal.Stop(ch)
-			gc.grpcServer.GracefulStop()
+			gs.server.Stop()
 			return
 		case syscall.SIGUSR2:
-			if _, err := gc.net.StartProcess(); err != nil {
-				gc.errors <- err
+			if _, err := gs.net.StartProcess(); err != nil {
+				gs.errors <- err
 			}
 		}
 	}
 }
 
-func (gc *graceMux) doWritePid(pid int) (err error) {
-	if gc.pidfile == "" {
+func (gs *graceServer) doWritePid(pid int) (err error) {
+	if gs.pidfile == "" {
 		return nil
 	}
 
-	pf, err := os.Create(gc.pidfile)
+	pf, err := os.Create(gs.pidfile)
 	defer pf.Close()
 	if err != nil {
 		log.Println(err)
