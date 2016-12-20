@@ -1,4 +1,4 @@
-package graceserver
+package grace
 
 import (
 	"bytes"
